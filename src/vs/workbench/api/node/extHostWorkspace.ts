@@ -16,6 +16,7 @@ import { compare } from 'vs/base/common/strings';
 import { TernarySearchTree } from 'vs/base/common/map';
 import { basenameOrAuthority, isEqual } from 'vs/base/common/resources';
 import { isLinux } from 'vs/base/common/platform';
+import { onUnexpectedError } from 'vs/base/common/errors';
 
 class Workspace2 extends Workspace {
 
@@ -32,7 +33,7 @@ class Workspace2 extends Workspace {
 		}
 	}
 
-	private readonly _workspaceFolders: vscode.WorkspaceFolder[] = [];
+	private _workspaceFolders: vscode.WorkspaceFolder[] = [];
 	private readonly _structure = TernarySearchTree.forPaths<vscode.WorkspaceFolder>();
 
 	private constructor(id: string, name: string, folders: WorkspaceFolder[]) {
@@ -48,6 +49,10 @@ class Workspace2 extends Workspace {
 
 	get workspaceFolders(): vscode.WorkspaceFolder[] {
 		return this._workspaceFolders.slice(0);
+	}
+
+	trySetWorkspaceFolders(folders: vscode.WorkspaceFolder[]): void {
+		this._workspaceFolders = folders.map(({ uri, name, index }) => new WorkspaceFolder({ name, index, uri: URI.revive(uri) }));
 	}
 
 	getWorkspaceFolder(uri: URI, resolveParent?: boolean): vscode.WorkspaceFolder {
@@ -88,7 +93,7 @@ export class ExtHostWorkspace implements ExtHostWorkspaceShape {
 		}
 	}
 
-	updateWorkspaceFolders(extensionName: string, index: number, deleteCount: number, ...workspaceFoldersToAdd: { uri: vscode.Uri, name?: string }[]): Thenable<boolean> {
+	updateWorkspaceFolders(extensionName: string, index: number, deleteCount: number, ...workspaceFoldersToAdd: { uri: vscode.Uri, name?: string }[]): boolean {
 		const validatedDistinctWorkspaceFoldersToAdd: { uri: vscode.Uri, name?: string }[] = [];
 		if (Array.isArray(workspaceFoldersToAdd)) {
 			workspaceFoldersToAdd.forEach(folderToAdd => {
@@ -99,26 +104,34 @@ export class ExtHostWorkspace implements ExtHostWorkspaceShape {
 		}
 
 		if ([index, deleteCount].some(i => typeof i !== 'number' || i < 0)) {
-			return Promise.resolve(false); // validate numbers
+			return false; // validate numbers
 		}
 
 		if (deleteCount === 0 && validatedDistinctWorkspaceFoldersToAdd.length === 0) {
-			return Promise.resolve(false); // nothing to delete or add
+			return false; // nothing to delete or add
 		}
 
 		const currentWorkspaceFolders: vscode.WorkspaceFolder[] = this._workspace ? this._workspace.workspaceFolders : [];
 		if (index + deleteCount > currentWorkspaceFolders.length) {
-			return Promise.resolve(false); // cannot delete more than we have
+			return false; // cannot delete more than we have
 		}
 
 		const newWorkspaceFolders = currentWorkspaceFolders.slice(0);
 		newWorkspaceFolders.splice(index, deleteCount, ...validatedDistinctWorkspaceFoldersToAdd.map((f, index) => ({ uri: f.uri, name: f.name || basenameOrAuthority(f.uri), index })));
 		const { added, removed } = delta(currentWorkspaceFolders, newWorkspaceFolders, ExtHostWorkspace._compareWorkspaceFolderByUriAndName);
 		if (added.length === 0 && removed.length === 0) {
-			return Promise.resolve(false); // nothing actually changed
+			return false; // nothing actually changed
 		}
 
-		return this._proxy.$updateWorkspaceFolders(extensionName, index, deleteCount, validatedDistinctWorkspaceFoldersToAdd);
+		// Trigger on main side
+		this._proxy.$updateWorkspaceFolders(extensionName, index, deleteCount, validatedDistinctWorkspaceFoldersToAdd).then(null, onUnexpectedError);
+
+		// Update directly here
+		if (this._workspace) {
+			this._workspace.trySetWorkspaceFolders(newWorkspaceFolders);
+		}
+
+		return true;
 	}
 
 	getWorkspaceFolder(uri: vscode.Uri, resolveParent?: boolean): vscode.WorkspaceFolder {
